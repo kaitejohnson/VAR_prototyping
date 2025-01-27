@@ -6,8 +6,88 @@ date: "2025-01-27"
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(readr)
+library(ggplot2)
 ```
 
 This R markdown is meant to be used to explore VAR models to fit multiple types of data and multiple data streams, loosely inspired by the multi-species model presented in <https://ecoevorxiv.org/repository/view/5143/>
 
 We will start by developing some simple toy models in stan to fit different types of data, for example ILI and ED visits for COVID, from different locations. We can eventually expand to apply to jointly fitting multiple wastewater data streams and multiple clinical data streams which may or may not be overlapping.
+
+## Load and clean data streams
+
+We will start by pulling in publicly available data from the European CDC's forecast hubs for COVID admissions, ARI incidence, and ILI incidence at the national level.
+
+```{r}
+covid_admits_raw <- readr::read_csv("https://raw.githubusercontent.com/european-modelling-hubs/RespiCast-Covid19/refs/heads/main/target-data/latest-hospital_admissions.csv")
+ARI_raw <- readr::read_csv("https://raw.githubusercontent.com/european-modelling-hubs/RespiCast-SyndromicIndicators/refs/heads/main/target-data/latest-ARI_incidence.csv")
+ILI_raw <- readr::read_csv("https://raw.githubusercontent.com/european-modelling-hubs/RespiCast-SyndromicIndicators/refs/heads/main/target-data/latest-ILI_incidence.csv")
+
+# Combine and plot the data 
+raw_data <- covid_admits_raw |> bind_rows(ARI_raw) |> bind_rows(ILI_raw)
+
+ggplot(raw_data) + geom_line(aes(x = truth_date, y = value, color = location),
+                             show.legend = FALSE) + 
+  facet_wrap(~ target, scales = "free_y", nrow = 1) +
+   cowplot::theme_half_open() +
+   cowplot::background_grid() +
+   theme(
+        axis.text.x = element_text(
+          size = 8, vjust = 1,
+          hjust = 1, angle = 45
+        )
+   ) + xlab("") + ylab("Reported value")
+
+ggplot(raw_data) + geom_line(aes(x = truth_date, y = value, color = target)) +
+  facet_wrap(~location, scales = "free_y") + 
+  cowplot::theme_half_open() +
+  cowplot::background_grid() +
+   theme(
+        axis.text.y = element_text(size = 6),
+        strip.text.x = element_text(size = 6),
+        axis.text.x = element_text(
+          size = 8, vjust = 1,
+          hjust = 1, angle = 45
+        ),
+        legend.position = "bottom"
+   ) + xlab("") + ylab("Reported value")
+  
+
+```
+
+For simplicity, we will focus on a few data streams but from heterogeneous locations.
+
+```{r}
+raw_data_subset <- raw_data |>
+  dplyr::filter(location %in% c("CZ","BG", "BE", "IE")) 
+
+ggplot(raw_data_subset) + geom_line(aes(x = truth_date, y = value, color = target)) +
+  facet_wrap(~location, scales = "free_y") + 
+  cowplot::theme_half_open() +
+  cowplot::background_grid() +
+   theme(
+        axis.text.y = element_text(size = 6),
+        strip.text.x = element_text(size = 6),
+        axis.text.x = element_text(
+          size = 8, vjust = 1,
+          hjust = 1, angle = 45
+        ),
+        legend.position = "bottom"
+   ) + xlab("") + ylab("Reported value")
+
+```
+
+We can see that even this truncated data contains some of the characteristics that make this forecasting problem tricky. For example, the ARI data from Ireland only started being collected and reported at the very end of 2024, and in Belgium, the hospital admissions data has not been reported since 2023.
+
+We are going to start by treating the locations of the data streams as unknown, though we will keep track of them for post processing. We could eventually add a layer of hierarchy by location, but for now we will rely on the model inferring the correlation between the signals within a location. So this means we will have 3 hospital admissions signals, 4 ARI incidence signals, and 3 ILI incidence signals.
+
+We'll start by doing some minimal pre-processing, creating some "spines" to map metadata such as location, target type, and date onto indices.
+
+```{r}
+n_forecast_days <- 28
+date_time_spine <- seq(from = min(raw_data_subset$truth_date),
+                       to = max(raw_data_subset$truth_date) + n_forecast_days,
+                       by = "day")
+
+```
