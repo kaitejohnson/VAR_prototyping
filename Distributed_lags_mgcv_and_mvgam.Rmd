@@ -1,0 +1,340 @@
+---
+title: "Distributed lags using mgcv and mvgam tutorial"
+output: html_document
+date: "2025-02-05"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(mvgam)           # Fit, interrogate and forecast DGAMs
+library(dplyr)           # Tidy and flexible data manipulation
+library(ggplot2)         # Flexible plotting
+library(gratia)          # Graceful plotting of smooth terms
+library(viridis)         # Plotting colours
+library(patchwork)       # Combining ggplot objects
+```
+
+This is based on the tutorial from Nicholas Clark's [GAMBLER blog](https://ecogambler.netlify.app/blog/distributed-lags-mgcv/)
+
+```{r}
+theme_set(theme_classic(base_size = 12, base_family = 'serif') +
+            theme(axis.line.x.bottom = element_line(colour = "black", size = 1), 
+                  axis.line.y.left = element_line(colour = "black", size = 1)))
+options(ggplot2.discrete.colour = c("#A25050",
+                                    "#8F2727",
+                                    'darkred',
+                                    "#630000"),
+        ggplot2.discrete.fill = c("#A25050",
+                                  "#8F2727",
+                                  'darkred',
+                                  "#630000"))
+```
+
+Load in portal data
+
+```{r}
+portal_ts <- read.csv('https://raw.githubusercontent.com/nicholasjclark/EFI_seminar/main/data/portal_data.csv', as.is = T)
+
+head(portal_ts)
+```
+
+Captures is the total monthly captures across all the plots for 4 different speciies, `ndvi_ma12` is the 12 month moving average of the NDVI vegetation index, `min_temp` is the monthly average minimum temperature. There are 80 time points, with lots of NAs which are when a measurement wasn't taken.
+
+`mvgam` needs a series command that acts as a factor indicator for the species.
+
+```{r}
+portal_ts <- portal_ts |>
+  mutate(series = as.factor(species))
+```
+
+Plot them using built in plotting functions from `mvgam`
+
+```{r} 
+plot_mvgam_series(data = portal_ts, y = 'captures', series = 'all')
+```
+Plot the first series, the DM species
+```{r}
+plot_mvgam_series(data = portal_ts, y = 'captures', series = 1)
+```
+Inspect some associations between log(captures + 1) and minimum temperature / NDVI moving average for each species to get a sense of how their relative abundances vary over seasons and with varying habitat conditions. First for DM
+```{r}
+portal_ts |>
+  filter(species == 'DM') %>%
+  ggplot(aes(x = mintemp, y = log(captures + 1))) +
+  geom_point() +
+  geom_smooth(method = "gam", formula = y ~ s(x, k = 12),
+              col = 'darkred', fill = "#A25050") +
+  labs(title = 'DM',
+       y = "log(captures)", 
+       x = 'Minimum temperature') +
+  
+  portal_ts |>
+  filter(species == 'DM') %>%
+  ggplot(aes(x = ndvi_ma12, y = log(captures + 1))) +
+  geom_point() +
+  geom_smooth(method = "gam", formula = y ~ s(x, k = 12),
+              col = 'darkred', fill = "#A25050") +
+  labs(y = NULL, 
+       x = 'NDVI moving average')
+```
+
+Looks like there might be some non linear effects, and we also know that rodents 
+in this system dont show immediate response to climate or environment changes, 
+the responses are often delayed and can be thought of as cumulative responses to 
+varying conditions over a period of months. How to capture using GAMs?
+Distributed lag modeling!
+
+`mgcv` does take in lists as an input, which allows us to apply some or all 
+of our covariates as matrices rather than vectors, and opens possibilities for
+more complex modeling. We will make use of this to set up the objects needed to 
+estimate nonlinear distributed lag functions. 
+
+The following function creates a lag matrix from a vector and the maximum lag 
+we want, with NAs used for the missing lag values at the beginning of the matrix. 
+Matrix is essentially an exposure history, where each row representes the lagged 
+values of the predictor that correspons to each observation in our outcome variable.
+We create a tensor product of this lagged covariate matrix and a matrix of equal 
+dimensions that indicates which lag each cell in the covariate matrix represents, 
+to set up a function that hcanges nonlinearly over lagged values of the covariate. 
+
+```{r}
+lagard <- function(x, n_lag = 6) {
+  n <- length(x)
+  X <- matrix(NA, n, n_lag)
+  for (i in 1:n_lag){
+    X[i:n, i] <- x[i:n - i + 1]
+  } 
+  return(X)
+}
+
+test_lagged_matrix <- lagard(x = rnorm(4, mean = 5, sd = 1), n_lag = 3)
+head(test_lagged_matrix)
+```
+Make use of this function to organise all data needed for modeling into a list. 
+for the simple example we will use lags of up to 6 months in the past. We will 
+have to remove the first five observations for each series. We can do this 
+by arranging the data by `series` and then by `time`. 
+```{r}
+# Binds together all the species lagged temperatures into a matrix, without
+# any indicators 75 time points by 4 species= 300 rows, 6 columns for each lagged 
+# time series
+mintemp <- do.call(rbind, 
+                   lapply(seq_along(levels(portal_ts$series)), 
+                          function(x){
+  tempdat <- 
+    portal_ts |>
+    filter(series == levels(portal_ts$series)[x]) |>
+    arrange(time) |>
+    select(mintemp, time) |>
+    pull(mintemp) 
+  
+  lag_mat <- lagard(tempdat, 6)
+  # Removes first 5 rows, which will get rid of any NAs
+  tail(lag_mat, NROW(lag_mat) - 5)
+}))
+dim(mintemp)[1]
+```
+Arrange the rest of the data in the same way (first by series, then by time)
+and put into a list 
+```{r}
+portal_ts <- portal_ts |>
+  arrange(series, time) |>
+  filter(time > 5) 
+
+data_all <- list(
+  lag = matrix(0:5, nrow(portal_ts), 6, byrow = TRUE),
+  captures = portal_ts$captures,
+  ndvi_ma12 = portal_ts$ndvi_ma12,
+  time = portal_ts$time,
+  series = portal_ts$series,
+  mintemp = mintemp)
+
+# The dimensions of all the objects need to match up
+dim(data_all$mintemp)
+length(data_all$time)
+```
+## Fit a distributed lag model for one species
+Easy to do for a single species, just go through and keep only the indices for
+one species
+```{r}
+pp_inds <- which(data_all$series == 'PP')
+data_pp <- lapply(data_all, function(x){
+  if(is.matrix(x)){
+    x[pp_inds, ]
+  } else {
+    x[pp_inds]
+  }
+})
+```
+
+Setting up the model is very straighforward, we wrap the `lag` and `mintemp` 
+matrices in a call to `te()`, which will set up a tensor product smoother from
+`mgcv`. We can also use a smooth temr for the `ndvi_ma12` in this model. 
+Use a Poisson observation model to keep things simple.
+```{r}
+mod1 <- gam(captures ~ 
+              te(mintemp, lag, k = 6) +
+              s(ndvi_ma12),
+            family = poisson(),
+            data = data_pp,
+            method = 'REML')
+summary(mod1)
+```
+
+How to interpret the distributed lag term? 
+Plot the term with mgcv
+```{r}
+plot(mod1, select = 1, scheme = 2)
+```
+Appears there is a nonlinear effect of `mintemp` that changes over different
+lags. How do we incorporate these effects for all species in the model at once?
+Usually in `mgcv` you can use the `by` argument to set up smoother that varya
+across levels of a factor, but this doesn't work with covariates that are 
+stored in a matrix format.The workaround is that you need to create weight 
+matrices for each level fo the grouping factor and set up group-level 
+hierarchical distributed lag terms.
+
+Need to tell the weights when they correspond to that series 
+```{r}
+weights_dm <- weights_do <- weights_pb <- weights_pp <- 
+  matrix(1, ncol = ncol(data_all$lag), nrow = nrow(data_all$lag))
+
+weights_dm[!(data_all$series == 'DM'), ] <- 0
+weights_do[!(data_all$series == 'DO'), ] <- 0
+weights_pb[!(data_all$series == 'PB'), ] <- 0
+weights_pp[!(data_all$series == 'PP'), ] <- 0
+head(weights_dm)
+head(weights_do)
+data_all$weights_dm <- weights_dm
+data_all$weights_do <- weights_do
+data_all$weights_pb <- weights_pb
+data_all$weights_pp <- weights_pp
+```
+Fit a multispecies GAM that includes distributed lag terms of mintemp
+for each species + smooths of ndvi for each species, random intercepts for each
+species and smooths of time for each species. Doesn't take temporal autocorrelation
+into account very wekk but it is useful to illustrate some principles. 
+
+```{r}
+mod2 <- gam(captures ~ 
+              # Hierarchical intercepts
+              s(series, bs = 're') +
+              
+              # Smooths of time to try and capture autocorrelation
+              s(time, by = series, k = 30) +
+              
+              # Smooths of ndvi_ma12
+              s(ndvi_ma12, by = series, k = 5) +
+              
+              # Distributed lags of mintemp
+              te(mintemp, lag, k = 4, by = weights_dm) +
+              te(mintemp, lag, k = 4, by = weights_do) +
+              te(mintemp, lag, k = 4, by = weights_pb) +
+              te(mintemp, lag, k = 4, by = weights_pp),
+            family = poisson(),
+            data = data_all,
+            control = list(nthreads = 6),
+            method = 'REML')
+summary(mod2)
+```
+And some plots
+```{r}
+draw(mod2, select = 2:5)
+draw(mod2, select = 6:9)
+draw(mod2, select = 10:13)
+```
+
+Plot conditional min temp effect for all species, by setting up prediction data
+taaht zeros out all covariates apart from the one of interest. We first 
+generate preictions with all covariates (including the `mintemp` covariate) 
+zeroed out to find the `baseline` prediction (centerd around the species 
+expeted average count on the log scale) so that we can shift by this baseline 
+for generating a zero-centered plot. 
+```{r}
+
+plot_dist_lags = function(model, data_all){
+  
+  all_species <- levels(data_all$series)
+  
+  # Loop across species to create the effect plot dataframe
+  sp_plot_dat <- do.call(rbind, lapply(all_species, function(sp){
+    
+    # Zero out all predictors to start the newdata
+    newdata <- lapply(data_all, function(x){
+      if(is.matrix(x)){
+        matrix(0, nrow = nrow(x), ncol = ncol(x))
+      } else {
+        rep(0, length(x))
+      }
+    })
+    
+    # Modify to only focus on the species of interest
+    newdata$series <- rep(sp, nrow(data_all$lag))
+    newdata$lag <- data_all$lag
+    which_weightmat <- grep(paste0('weights_', 
+                                   tolower(sp)), 
+                            names(newdata))
+    newdata[[which_weightmat]] <- matrix(1, nrow = nrow(newdata[[which_weightmat]]),
+                                         ncol = ncol(newdata[[which_weightmat]]))
+    
+    # Calculate predictions for when mintemp is zero to find the baseline
+    # value for centring the plot
+    if(inherits(model, 'mvgam')){
+      preds <- predict(model, newdata = newdata, 
+                       type = 'link', process_error = FALSE)
+      preds <- apply(preds, 2, median)
+    } else {
+      preds <- predict(model, newdata = newdata, type = 'link')
+    }
+
+    offset <- mean(preds)
+    plot_dat <- do.call(rbind, lapply(seq(1:6), function(lag){
+      # Set up prediction matrix for mintemp; 
+      # use a sequence of values across the full range of observed values
+      newdata$mintemp <- matrix(0, ncol = ncol(newdata$lag),
+                                nrow = nrow(newdata$lag))
+      newdata$mintemp[,lag] <- seq(min(data_all$mintemp),
+                                   max(data_all$mintemp),
+                                   length.out = length(newdata$time))
+      
+      # Predict on the link scale and shift by the offset 
+      # so that values are roughly centred at zero
+      if(inherits(model, 'mvgam')){
+       preds <- predict(model, newdata = newdata, 
+                        type = 'link', process_error = FALSE) 
+       preds <- apply(preds, 2, median)
+      } else {
+       preds <- predict(model, newdata = newdata,
+                        type = 'link') 
+      }
+      preds <- preds - offset
+      
+      data.frame(lag = lag,
+                 preds = preds,
+                 mintemp = seq(min(data_all$mintemp),
+                                   max(data_all$mintemp),
+                                   length.out = length(newdata$time)))
+    }))
+    plot_dat$species <- sp
+    
+    plot_dat
+  }))
+
+  # Build the facetted distributed lag plot
+  ggplot(data = sp_plot_dat %>%
+           dplyr::mutate(lag = as.factor(lag)),
+         aes(x = mintemp, y = preds, 
+             colour = lag, fill = lag)) +
+    facet_wrap(~ species, scales = 'free') +
+    geom_hline(yintercept = 0) +
+    # Use geom_smooth, though beware these uncertainty
+    # intervals aren't necessarily correct
+    geom_smooth() +
+    scale_fill_viridis(discrete = TRUE) +
+    scale_colour_viridis(discrete = TRUE) +
+    labs(x = 'Minimum temperature (z-scored)',
+         y = 'Partial effect')
+  
+}
+plot_dist_lags(mod2, data_all)
+```
