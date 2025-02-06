@@ -1,0 +1,122 @@
+---
+title: "State space vector autoregressions with mvgam"
+output: html_document
+date: "2025-02-06"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(mvgam)           # Fit, interrogate and forecast DGAMs
+library(tidyverse)       # Tidy and flexible data manipulation
+library(ggplot2)         # Flexible plotting
+library(tidybayes)       # Graceful plotting of Bayesian posterior estimates
+library(farver)          # Colour space manipulations
+
+theme_set(theme_classic(base_size = 15,
+                        base_family = 'serif'))
+myhist = function(...){
+  geom_histogram(col = 'white',
+                 fill = '#B97C7C', ...)
+}
+hist_theme = function(){
+  theme(axis.line.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.y = element_blank())
+}
+```
+
+## 
+
+This is a tutorial from the vignette in `mvgam` on [state-space vector autoregressions](https://ecogambler.netlify.app/blog/vector-autoregressions/). It demonstrates how the `mvgam` package and fit a state-space VAR model with a non-Gaussian observation model.
+
+Load the data. This is from a set of annual American kestrel abundance time seres. These contain adjusted annual counts of the species taken in three regions of Britich Columbia, Canada. As formatted there are 40 years of data with a column for each of the regions.
+
+```{r}
+load(url('https://github.com/atsa-es/MARSS/raw/master/data/kestrel.rda'))
+head(kestrel)
+
+# Put the data in long format 
+model_data <- kestrel |>
+  as.data.frame() |>
+  tidyr::pivot_longer(!Year, 
+                      names_to = "region",
+                      values_to = "log_count") |>
+  mutate(adj_count =exp(log_count),
+         series = as.factor(region),
+         time = Year)
+head(model_data)
+
+plot_mvgam_series(data = model_data, 
+                  y = "adj_count",
+                  series = "all")
+plot_mvgam_series(data = model_data,
+                  y = 'adj_count',
+                  series = 1)
+
+
+```
+
+The outcome variable only takes non-negative real numbers
+
+## Fit a VAR(1) model
+
+We will use the `trend_formula()` argument to specify we want a state-space model, and we can use the `trend_model()` to specify that we want the latent process to evolve as Vector Autoregression of order 1. This takes advantage of developments in the field that enforce stationarity through a principled prior on the autoregressive coefficients. Because magnitude of average coutns varies across regions, we will need to include region level intercepts in the process model. And since the response variable is non-negative real variables, we can choose to use a Gamma distribution for the observation model.
+
+First look at the default prior distributions for the parameters in the model
+
+```{r}
+def_priors <- get_mvgam_priors(adj_count ~ -1,
+                               trend_formula = ~region,
+                               trend_model = VAR(cor = TRUE),
+                               data = model_data,
+                               family = Gamma())
+
+```
+
+We will want to adjust these priors from the defaults based on domain knowledge.
+
+```{r}
+
+var_mod <- mvgam(
+  # Observation formula, empty to only consider the Gamma observation process
+  formula = adj_count ~ -1,
+  
+  # Process model formula that includes regional intercepts
+  trend_formula = ~ region,
+  
+  # A VAR(1) dynamic process with fully parameterized covariance matrix Sigma
+  trend_model = VAR(cor = TRUE),
+  
+  priors = c(prior(std_normal(), class = Intercept_trend),
+             prior(std_normal(), class = b),
+             prior(exponential(2.5), class = sigma)),
+  
+  # The time series data in `long` format
+  data = model_data,
+  
+  # A gamma observation family 
+  family = Gamma(),
+  
+  # Forcing all three series to share the same Gamma shape parameter
+  share_obs_params = TRUE,
+  
+  #Stan control arguments
+  adapt_delta = 0.95,
+  burnin = 1000,
+  samples = 1000,
+  silent = 2
+)
+
+```
+
+```{r}
+summary(var_mod)
+
+
+```
+
+Plot some things, in particular, we want to look at the process and observation scale parameters (`sigma` and `shape` in the model's MCMC output)
+
+```{r}
+conditional_effects(var_mod)
+```
