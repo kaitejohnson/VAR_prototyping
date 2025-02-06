@@ -250,9 +250,10 @@ generate preictions with all covariates (including the `mintemp` covariate)
 zeroed out to find the `baseline` prediction (centerd around the species 
 expeted average count on the log scale) so that we can shift by this baseline 
 for generating a zero-centered plot. 
+* Note this isn't working currently* 
 ```{r}
 
-plot_dist_lags = function(model, data_all){
+plot_dist_lags <- function(model, data_all){
   
   all_species <- levels(data_all$series)
   
@@ -338,3 +339,35 @@ plot_dist_lags = function(model, data_all){
 }
 plot_dist_lags(mod2, data_all)
 ```
+
+Use mvgam, replace the smooth functions of time with dynamic processes that can 
+capture temporal autocorrelation in the observations.
+```{r}
+
+mod3 <- mvgam(captures ~
+                # Hierarchical intercepts 
+                s(series, bs = "re") + 
+                
+                # Smooths of ndvi_ma12
+                s(ndvi_ma12, by = series, k = 6) + 
+                
+                # Distributed lags of mintemp
+                te(mintemp, lag, k = c(8,5), by = weights_dm) + 
+                te(mintemp, lag, k = c(8,5), by = weights_do) + 
+                te(mintemp, lag, k = c(8,5), by = weights_pb) + 
+                te(mintemp, lag, k = c(8,5), by = weights_pp) ,
+              
+              # Latent dynamic processes to calture autocorrelation
+              trend_model = AR(),
+              family = poisson(),
+              data = data_all)
+
+summary(mod3, include_betas = FALSE)
+```
+```{r}
+plot(mod3, type = "trend", series = 1)
+```
+                
+  
+)
+``
