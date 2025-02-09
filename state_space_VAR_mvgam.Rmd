@@ -119,4 +119,33 @@ Plot some things, in particular, we want to look at the process and observation 
 
 ```{r}
 conditional_effects(var_mod)
+mcmc_plot(var_mod,
+          variable = 'sigma',
+          regex = TRUE,
+          type = 'trace')
+mcmc_plot(var_mod,
+          variable = 'shape',
+          type = 'trace')
+pairs(var_mod,
+      variable = c('shape', 'sigma'),
+      regex = TRUE,
+      off_diag_args = list(size = 1,
+                           alpha = 0.5))
+```
+Posterior predictive checks, integrating over all the stable temporal states for
+each series (if there were no observations to inform the states of the latent 
+VAR(1) process)
+```{r}
+pp_check(var_mod,
+         type = "dens_overlay_grouped",
+         group = "region",
+         ndraws = 50)
+```
+
+Conditional posterior predictive checks using the actual latent states
+estimated when the model condition on observed data
+```{r}
+ppc(var_mod,
+    series = 1,
+    type = 'density')
 ```
