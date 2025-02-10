@@ -132,9 +132,9 @@ pairs(var_mod,
       off_diag_args = list(size = 1,
                            alpha = 0.5))
 ```
-Posterior predictive checks, integrating over all the stable temporal states for
-each series (if there were no observations to inform the states of the latent 
-VAR(1) process)
+
+Posterior predictive checks, integrating over all the stable temporal states for each series (if there were no observations to inform the states of the latent VAR(1) process)
+
 ```{r}
 pp_check(var_mod,
          type = "dens_overlay_grouped",
@@ -142,10 +142,137 @@ pp_check(var_mod,
          ndraws = 50)
 ```
 
-Conditional posterior predictive checks using the actual latent states
-estimated when the model condition on observed data
+Conditional posterior predictive checks using the actual latent states estimated when the model condition on observed data
+
 ```{r}
 ppc(var_mod,
     series = 1,
     type = 'density')
 ```
+
+Next we can comput and plot probabilistic conditional hindcasts for each series.
+```{r}
+hcs <- hindcast(var_mod)
+plot(hcs, series = 1)
+```
+
+## Model expansion
+
+Given there are variations in the shapes of these observed distributions for each series, 
+it may be worth trying to fit an equivalent model that allows the Gamma 
+shape parameters to vary among series. Let's fit a second model that
+allows this:
+```{r}
+var_mod2 <- mvgam(
+  # Observation formula, empty to only consider the Gamma observation process
+  formula = adj_count ~ -1,
+  
+  # Process model formula that includes regional intercepts
+  trend_formula = ~ region,
+  
+  # A VAR(1) dynamic process with fully parameterized covariance matrix Sigma
+  trend_model = VAR(cor = TRUE),
+  
+  priors = c(prior(std_normal(), class = Intercept_trend),
+             prior(std_normal(), class = b),
+             prior(exponential(2.5), class = sigma)),
+  
+  # The time series data in `long` format
+  data = model_data,
+  
+  # A gamma observation family 
+  family = Gamma(),
+  
+  # Varying Gamma shape parameters per series
+  share_obs_params = FALSE,
+  
+  #Stan control arguments
+  adapt_delta = 0.95,
+  burnin = 1000,
+  samples = 1000,
+  silent = 2
+)
+```
+
+This model fits well, but we now have three shape parameters to inspect:
+```{r}
+mcmc_plot(var_mod2,
+          variable = 'shape',
+          regex = TRUE,
+          type = 'trace')
+```
+Unconditional posterior predictive checks look slighly better for the first
+and third series, as do the probabilisstic conditonal hindcasts
+```{r}
+pp_check(var_mod2,
+         type = "dens_overlay_grouped",
+         group = "region",
+         ndraws = 50)
+hcs <- hindcast(var_mod2)
+plot(hcs, series = 1)
+```
+
+Model compare with `loo_compare()`
+```{r}
+loo_compare(var_mod, var_mod2)
+```
+
+## Interrogating the model
+
+### Inspecting AR coefficient and covariance estimates 
+Inspect the A matrix, which includes the autoregressive coefficeints that 
+estimate lagged dependencies and cross dependence between the elements of the 
+latent process model. `bayesplot` will plot these in the wrong order by
+default so we rearrange.
+```{r}
+A_pars <- matrix(NA, nrow = 3, ncol = 3)
+for(i in 1:3){
+  for(j in 1:3){
+    A_pars[i, j] <- paste0('A[', i, ',', j, ']')
+  }
+}
+mcmc_plot(var_mod2,
+          variable = as.vector(t(A_pars)),
+          type = 'hist') +
+  geom_vline(xintercept = 0,
+             col = 'white',
+             linewidth = 2) +
+  geom_vline(xintercept = 0,
+             linewidth = 1)
+```
+
+Broad posterior support for positive interactions among the three latent 
+processes. For example, the estimate in A[2,3] capture how an increase in the process fpr 
+series 2, BC, a time t is expected to implact the process for series 3, Sask at time t+1.
+
+We might also want to look at evidence for contemporaneous associations among these
+processes, which are captured in the covariance matrix $\Sigma_{process}$. 
+
+```{r}
+
+Sigma_pars <- matrix(NA, nrow = 3, ncol = 3)
+for(i in 1:3){
+  for(j in 1:3){
+    Sigma_pars[i, j] <- paste0('Sigma[', i, ',', j, ']')
+  }
+}
+mcmc_plot(var_mod2,
+          variable = as.vector(t(Sigma_pars)),
+          type = 'hist') +
+  geom_vline(xintercept = 0,
+             col = 'white',
+             linewidth = 2) +
+  geom_vline(xintercept = 0,
+             linewidth = 1)
+```
+
+Because we see many positive covariances, this suggests that these processes are
+not evolving independently, but are rather likely to be co-responding
+to some broader phenomena. 
+ 
+Can also compute some measures of stability/reactivity, and the relative
+contributions of the A matrix and process error to the stability of the 
+distribution. 
+
+
+ 
