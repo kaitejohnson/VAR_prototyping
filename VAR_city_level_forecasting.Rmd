@@ -1,0 +1,157 @@
+---
+title: "state space VAR city level forecasting"
+output: html_document
+date: "2025-02-10"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(mvgam)           # Fit, interrogate and forecast DGAMs
+library(tidyverse)       # Tidy and flexible data manipulation
+library(ggplot2)         # Flexible plotting
+library(tidybayes)       # Graceful plotting of Bayesian posterior estimates
+library(farver)          # Colour space manipulations
+library(lubridate)       # Date formatting
+
+theme_set(theme_classic(base_size = 15,
+                        base_family = 'serif'))
+myhist = function(...){
+  geom_histogram(col = 'white',
+                 fill = '#B97C7C', ...)
+}
+hist_theme = function(){
+  theme(axis.line.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.y = element_blank())
+}
+```
+## Introduction
+
+This is based on the `mvgam` tutorial on [state-space vector autoregressions](https://ecogambler.netlify.app/blog/vector-autoregressions/). 
+We're going to take a first pass at fitting a vector ARIMA to the city level 
+forecasting data from NYC available as part of the [Flu Metrocast Hub](https://github.com/reichlab/flu-metrocast).
+We'll start by grabbing a vintage of the data from January 3rd, 2025. 
+
+## Load the data
+
+This is from a dataset containing counts of new ED visits due to ILI from each of
+the 5 boroughs, plus citywide admissions and unknown admissions, from March of 2017 
+through the day before the forecast date (January 2nd, 2025). 
+```{r}
+
+raw_data <- read.csv("https://raw.githubusercontent.com/reichlab/flu-metrocast/refs/heads/main/raw-data/NYC_ED_daily_asof_01-03-2025.csv")
+head(raw_data)
+
+data_formatted <- raw_data |>
+  mutate(
+    date = as.Date(Date, format = "%m/%d/%Y") + years(2000),
+    time = as.integer(date - min(date) + 1),
+    count = as.integer(X),
+    series = as.factor(Dim1Value)
+  ) |>
+  filter(Dim2Value == "All age groups", 
+         !is.na(count)) |>
+  rename(location = Dim1Value) |>
+  select(time, date, count, series, location)
+   
+
+ggplot(data_formatted) +
+  geom_line(aes(x = time, y = count)) +
+  facet_wrap(~series, scales = "free_y") +
+  theme_bw()
+
+plot_mvgam_series(data = data_formatted,
+                  y = "count",
+                  series = "all")
+
+plot_mvgam_series(data = data_formatted,
+                  y = "count",
+                  series = 1)
+```
+## Data wrangling
+
+We need to have every time point for every location in the dataset, 
+even if it is missing so the indices all line up for stan. 
+We also will have to pass in the lagged matrices we want, as is 
+done in the distributed lag tutorial. We can do so by creating a full spine
+of the dates and joining the data to that
+on the dates and values, and then following the tutorial to set up the
+lagged matrices. 
+```{r}
+date_df <- data.frame(date = 
+                        seq(from = min(data_formatted$date), 
+                            to = max(data_formatted$date), 
+                            by = "days") 
+)
+# Expand to have rows for all date-location combinations, even if they are missing
+model_data <- data_formatted |>
+  right_join(date_df)
+
+# Eventually fill in missing data with something model based, for now just
+# fill in with mean 
+model_data$count[is.na(model_data$count)] <- round(mean(model_data$count))
+
+model_data <- model_data |>
+  filter(!is.na(location))
+ggplot(model_data) +
+  geom_line(aes(x = time, y = count)) +
+  facet_wrap(~series, scales = "free_y") +
+  theme_bw()
+
+# Feature engineering
+#1. Distributed lag matrices for environmental covariates
+# Function to set up a lag matrix for distributed lag nonlinear models
+lagard <- function(x, n_lag = 6){
+  n <- length(x)
+  X <- matrix(NA, n, n_lag)
+  for (i in 1:n_lag) X[i:n, i] <- x[i:n - i + 1]
+  X
+}
+
+
+
+
+
+```
+
+## Fit a VAR(1) model
+We will use the `trend_formula()` argument to specify we want a state-space model, and we can use the `trend_model()` to specify that we want the latent process to evolve as Vector Autoregression of order 1. This takes advantage of developments in the field that enforce stationarity through a principled prior on the autoregressive coefficients. Because magnitude of average coutns varies across regions, we will need to include region level intercepts in the process model. And since the response variable is positive integered values, we can choose to use a Poisson distribution for the observation model.
+
+First look at the default prior distributions for the parameters in the model
+
+```{r}
+def_priors <- get_mvgam_priors(count ~ -1,
+                               trend_formula = ~s(trend, bs = "re") -1,
+                               trend_model = "AR1",
+                               data = model_data,
+                               family = poisson())
+
+```
+
+```{r}
+var_mod <- mvgam(
+  # Observation formula, empty to only consider the Gamma observation process
+  formula = count ~ -1,
+  
+  # Process model formula that includes regional intercepts
+  trend_formula = ~ s(trend, bs = "re") ,
+  
+  # A VAR(1) dynamic process with fully parameterized covariance matrix Sigma
+  trend_model = AR(),
+  
+  # The time series data in `long` format
+  data = data_formatted,
+  
+  # A gamma observation family 
+  family = poisson(),
+  
+  # Forcing all three series to share the same Gamma shape parameter
+  share_obs_params = FALSE,
+  
+  #Stan control arguments
+  adapt_delta = 0.95,
+  burnin = 1000,
+  samples = 1000,
+  silent = 2
+)
+```
