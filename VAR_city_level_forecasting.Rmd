@@ -27,8 +27,22 @@ hist_theme = function(){
 ```
 ## Introduction
 
-This is based on the `mvgam` tutorial on [state-space vector autoregressions](https://ecogambler.netlify.app/blog/vector-autoregressions/). 
-We're going to take a first pass at fitting a vector ARIMA to the city level 
+This is based on the `mvgam` tutorial on [state-space vector autoregressions](https://ecogambler.netlify.app/blog/vector-autoregressions/),
+as well as the code developed to fit the portal data in the both the 
+[portal_VAR](https://github.com/nicholasjclark/portal_VAR) repository and 
+the [distributed lags tutorial](https://ecogambler.netlify.app/blog/distributed-lags-mgcv/).
+
+The first tutorial uses data from multiple locations fit to a single species of
+birds in Canada with no additional covariantes, the second two projects are fit 
+to data on differet species of rats with additional covariates of minimum 
+temperature and vegetation index. 
+
+We're going to treat year, week, and day of the week as our covariates, and
+the different boroughs as our different series, analagous to to the species or
+locations in the above examples. 
+
+We're going to take a first pass at fitting an time series (AR1, ARIMA, VARIMA) 
+to the city level 
 forecasting data from NYC available as part of the [Flu Metrocast Hub](https://github.com/reichlab/flu-metrocast).
 We'll start by grabbing a vintage of the data from January 3rd, 2025. 
 
