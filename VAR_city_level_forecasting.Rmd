@@ -158,6 +158,17 @@ ggplot(model_data) +
   facet_wrap(~series, scales = "free_y") +
   theme_bw()
 
+# Make a plot of the time series overlaid to see if can visually see leading 
+# vs lagging trends 
+ggplot(model_data |> group_by(location) |>
+         mutate(rel_count = count/max(count)))+
+  geom_line(aes(x = time, 
+                y = rel_count, 
+                color = location), alpha = 0.3) +
+  theme_bw()
+
+
+
 
 ```
 
@@ -193,10 +204,46 @@ forecast_data <- model_data |>
   filter(date > max(model_data$date))
 ```
 
+## Model 1: Dynamic hierarchical GAM
 Define a state-space dynamical hierarchical GAM. Start using AR1 trend model,
 later can look into a vector autoregression which will jointly estimate the
-AR coefficients across the locations. 
+AR coefficients across the locations... 
+$$
+y_{l,t} \sim Poisson(exp(x_{l,t})) \\
+x_{l,t} \sim MVN(\mu_{l,t} + \delta_{l} x_{l,t-1},  \Sigma_{process})\\
+\mu_{l,t} = \beta_l + f_{global,t}(week) + f_{l,t}(week) + f_{global,t}(wday) \\
+\beta_l \sim Normal(\beta_{global}, \sigma_{count}) \\
+\beta_{global} \sim Normal(log(avgcount), 1) \\
+\sigma_{count} \sim exp(0.33) \\
+\delta_l \sim Normal(0.5, 0.25) \\
+\Sigma_{process} = \sigma * C * \sigma \\
+\sigma \sim exp(1) \\
+C \sim LKJcorr(2)
+
+
+$$
+Start by getting the default parameters and modifying
 ```{r}
+def_priors <- get_mvgam_priors(formula = count ~ -1,
+                               trend_formula = ~ 
+                                 s(trend, bs = "re") + 
+                                 s(week, k = 12) +
+                                 s(week, trend, bs = "sz", k = 12) - 1 +
+                                 s(day_of_week, k = 3),
+                               trend_model = 'AR1',
+                               data = model_data,
+                               family = poisson())
+```
+Inform prior on the global mean of the intercept using the data 
+```{r}
+
+print(log(mean(model_data$count, na.rm = TRUE)))
+```
+
+
+
+```{r}
+
 ar_mod <- mvgam(
   # Observation formula, empty to only consider the Gamma observation process
   formula = count ~ -1,
@@ -206,9 +253,9 @@ ar_mod <- mvgam(
     # Hierarchical intercepts capture variation in average count
     s(trend, bs = "re") + 
     # Hierarchical effects of year(shared smooth)
-    s(year, k = 3) +
-    # Borough level deviations
-    s(year, trend, bs = "sz", k = 3) -1 + 
+    # s(year, k = 3) +
+    # # Borough level deviations
+    # s(year, trend, bs = "sz", k = 3) -1 + 
     
     # Hierarchical effects of week(shared smooth)
     s(week, k = 12) +
@@ -216,16 +263,19 @@ ar_mod <- mvgam(
     s(week, trend, bs = "sz", k = 12) - 1 +
     
     # Shared smooth of day of week 
-    s(day_of_week, k = 3), 
+    s(day_of_week, k = 3),
   trend_model = 'AR1',
-  priors = c(prior(exponential(1), class = sigma),
-                         prior(normal(0.5, 0.25), class = ar1,
-                               lb = -1, ub = 1)),
+  #Adjust the priors 
+  priors = c(
+    prior(normal(4.7, 1), class = mu_raw_trend),
+    prior(exponential(0.33), class = sigma_raw_trend),
+  
+    prior(exponential(1), class = sigma),
+    prior(normal(0.5, 0.25), class = ar1, lb = -1, ub = 1)),
   data = model_data,
   newdata = forecast_data,
   backend = 'cmdstanr',
-  family = poisson(),
-  noncentred = TRUE
+  family = poisson()
 )
 ```
 Look at some things
@@ -248,7 +298,6 @@ mcmc_plot(ar_mod,
           variable = 'sigma',
           regex = TRUE,
           type = 'trace')
-pairs(ar_mod, variable = c('mean(s(trend))_trend', 'sd(s(trend))_trend'))
 
 mcmc_plot(ar_mod, variable = 'ar1', regex = TRUE, type = 'areas')
 plot_slopes(ar_mod,
@@ -263,12 +312,6 @@ plot(ar_mod, type = 'smooths', trend_effects = TRUE)
 # Hierarchical intercepts ?? Actually not sure 
 plot(ar_mod, type = 're', trend_effects = TRUE)
 
-plot_slopes(ar_mod,
-            variable = 'year',
-            condition = c('series', 'series'),
-            type = 'link') +
-  theme(legend.position = 'none') +
-  labs(y = 'Log(counts)', x = 'Location')
 ```
 # Plot the forecasts and the residuals 
 ```{r}
@@ -289,7 +332,139 @@ plot(ar_mod, type = 'residuals', series = 5)
 plot(ar_mod, type = 'residuals', series = 6)
 plot(ar_mod, type = 'residuals', series = 7)
 ```
+
+
+## Model 2: Hierarchical GAM + vector autorgression 
+Define a state-space dynamical hierarchical GAM with a vector autoregression 
+to account for dependencies between the locations
+$$
+y_{l,t} \sim Poisson(exp(x_{l,t})) \\
+x_{l,t} \sim MVN(\mu_{l,t} + A x_{l,t-1},  \Sigma_{process})\\
+\mu_{l,t} = \beta_l + f_{global,t}(week) + f_{l,t}(week) + f_{global,t}(wday) \\
+\beta_l \sim Normal(\beta_{global}, \sigma_{count}) \\
+\beta_{global} \sim Normal(log(avgcount), 1) \\
+\sigma_{count} \sim exp(0.33) \\
+\delta_l \sim Normal(0.5, 0.25) \\
+\Sigma_{process} = \sigma * C * \sigma \\
+A \exists P(R)\\
+P \sim Normal(0, 0.67) \\
+\sigma \sim exp(1) \\
+C \sim LKJcorr(2)
+
+
+$$
+```{r}
+def_priors_var <- get_mvgam_priors(formula = count ~ -1,
+                                   trend_formula = ~ 
+                                   s(trend, bs = "re") + 
+                                   s(week, k = 12) +
+                                   s(week, trend, bs = "sz", k = 12) - 1 +
+                                  s(day_of_week, k = 3),
+                                  trend_model = VAR(cor = TRUE),
+                                  data = model_data,
+                                 family = poisson())
+```
+Note this model is a lot slower because of all the off-diagonal 
+components of A that we are now estimating!
+```{r}
+var_mod <- mvgam(
+  # Observation formula, empty to only consider the Gamma observation process
+  formula = count ~ -1,
   
- 
- 
+  # Process model formula that includes regional intercepts
+  trend_formula = ~ 
+    # Hierarchical intercepts capture variation in average count
+    s(trend, bs = "re") + 
+    # Hierarchical effects of year(shared smooth)
+    # s(year, k = 3) +
+    # # Borough level deviations
+    # s(year, trend, bs = "sz", k = 3) -1 + 
+    
+    # Hierarchical effects of week(shared smooth)
+    s(week, k = 12) +
+    # Borough level deviations 
+    s(week, trend, bs = "sz", k = 12) - 1 +
+    
+    # Shared smooth of day of week 
+    s(day_of_week, k = 3),
+  trend_model = VAR(cor = TRUE),
+  #Adjust the priors 
+  priors = c(
+    prior(normal(4.7, 1), class = mu_raw_trend),
+    prior(exponential(0.33), class = sigma_raw_trend),
+    prior(exponential(1), class = sigma)
+    ),
+  data = model_data,
+  newdata = forecast_data,
+  backend = 'cmdstanr',
+  family = poisson()
+)
+```
+Make the same plots as previously
+```{r}
+summary(var_mod)
+
+plot_predictions(var_mod,
+                 condition = c('week', 'series'),
+                 points = 0.5, conf_level = 0.5) +
+  labs(y = "Counts", x = "week")
+
+plot_predictions(var_mod,
+                 condition = c('week', 'day_of_week', 'series'),
+                 points = 0.5, conf_level = 0.5) +
+  labs(y = "Counts", x = "week")
+
+conditional_effects(var_mod)
+mcmc_plot(ar_mod,
+          variable = 'sigma',
+          regex = TRUE,
+          type = 'trace')
+
+plot_slopes(var_mod,
+            variable = 'week',
+            condition = c('series', 'series'),
+            type = 'link') +
+  theme(legend.position = 'none') +
+  labs(y = 'Log(counts)', x = 'Location')
+
+# Hierarchical trend effects
+plot(var_mod, type = 'smooths', trend_effects = TRUE)
+# Hierarchical intercepts ?? Actually not sure 
+plot(var_mod, type = 're', trend_effects = TRUE)
+```
   
+ # Plot the forecasts and the residuals 
+```{r}
+# Fit and forecasts
+plot(var_mod, type = 'forecast', series = 1)
+plot(var_mod, type = 'forecast', series = 2)
+plot(var_mod, type = 'forecast', series = 3)
+plot(var_mod, type = 'forecast', series = 4)
+plot(var_mod, type = 'forecast', series = 5)
+plot(var_mod, type = 'forecast', series = 6)
+plot(var_mod, type = 'forecast', series = 7)
+
+plot(var_mod, type = 'residuals', series = 1)
+plot(var_mod, type = 'residuals', series = 2)
+plot(var_mod, type = 'residuals', series = 3)
+plot(var_mod, type = 'residuals', series = 4)
+plot(var_mod, type = 'residuals', series = 5)
+plot(var_mod, type = 'residuals', series = 6)
+plot(var_mod, type = 'residuals', series = 7)
+```
+
+Compare models
+```{r}
+loo_compare(var_mod, ar_mod)
+```
+ 
+Other options to add:
+- could try the first version as an ARIMA, second as a VARIMA? 
+using `trend_model = AR(p = 1, d = 1, q = 1) /VAR (p = 1, d = 1, q = 1)`
+- could fit to the full time series (expect would take a lot longer, but 
+need to test this as I don't think it would increase the number of parameters)
+- Could try getting rid of the day of week effect and just aggregating the data
+to weekly and fitting that, excluding the last two days since they are an 
+incomplete epiweek (but feels like info lost)
+- different observation models e.g. negative binomial 
+
