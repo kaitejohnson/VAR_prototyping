@@ -203,22 +203,20 @@ ar_mod <- mvgam(
   
   # Process model formula that includes regional intercepts
   trend_formula = ~ 
-    # Hierarhical intercepts capture variation in average count
+    # Hierarchical intercepts capture variation in average count
     s(trend, bs = "re") + 
     # Hierarchical effects of year(shared smooth)
-    s(year, k = 2) +
+    s(year, k = 3) +
     # Borough level deviations
-    s(year, trend, bs = "sz", k = 2) -1 + 
+    s(year, trend, bs = "sz", k = 3) -1 + 
     
     # Hierarchical effects of week(shared smooth)
     s(week, k = 12) +
     # Borough level deviations 
     s(week, trend, bs = "sz", k = 12) - 1 +
     
-    # Hierarchical effects of day of week (shared smooth)
-    s(day_of_week, k = 3) +
-    # Borough level deviations
-    s(day_of_week, trend, bs = "sz", k = 3) - 1,
+    # Shared smooth of day of week 
+    s(day_of_week, k = 3), 
   trend_model = 'AR1',
   priors = c(prior(exponential(1), class = sigma),
                          prior(normal(0.5, 0.25), class = ar1,
@@ -226,27 +224,72 @@ ar_mod <- mvgam(
   data = model_data,
   newdata = forecast_data,
   backend = 'cmdstanr',
-  family = poisson()
-)
-```
-
-  
-  # A VAR(1) dynamic process with fully parameterized covariance matrix Sigma
-  trend_model = AR(),
-  
-  # The time series data in `long` format
-  data = data_formatted,
-  
-  # A gamma observation family 
   family = poisson(),
-  
-  # Forcing all three series to share the same Gamma shape parameter
-  share_obs_params = FALSE,
-  
-  #Stan control arguments
-  adapt_delta = 0.95,
-  burnin = 1000,
-  samples = 1000,
-  silent = 2
+  noncentred = TRUE
 )
 ```
+Look at some things
+```{r}
+
+summary(ar_mod)
+
+plot_predictions(ar_mod,
+                 condition = c('week', 'series'),
+                 points = 0.5, conf_level = 0.5) +
+  labs(y = "Counts", x = "week")
+
+plot_predictions(ar_mod,
+                 condition = c('week', 'day_of_week', 'series'),
+                 points = 0.5, conf_level = 0.5) +
+  labs(y = "Counts", x = "week")
+
+conditional_effects(ar_mod)
+mcmc_plot(ar_mod,
+          variable = 'sigma',
+          regex = TRUE,
+          type = 'trace')
+pairs(ar_mod, variable = c('mean(s(trend))_trend', 'sd(s(trend))_trend'))
+
+mcmc_plot(ar_mod, variable = 'ar1', regex = TRUE, type = 'areas')
+plot_slopes(ar_mod,
+            variable = 'week',
+            condition = c('series', 'series'),
+            type = 'link') +
+  theme(legend.position = 'none') +
+  labs(y = 'Log(counts)', x = 'Location')
+
+# Hierarchical trend effects
+plot(ar_mod, type = 'smooths', trend_effects = TRUE)
+# Hierarchical intercepts ?? Actually not sure 
+plot(ar_mod, type = 're', trend_effects = TRUE)
+
+plot_slopes(ar_mod,
+            variable = 'year',
+            condition = c('series', 'series'),
+            type = 'link') +
+  theme(legend.position = 'none') +
+  labs(y = 'Log(counts)', x = 'Location')
+```
+# Plot the forecasts and the residuals 
+```{r}
+# Fit and forecasts
+plot(ar_mod, type = 'forecast', series = 1)
+plot(ar_mod, type = 'forecast', series = 2)
+plot(ar_mod, type = 'forecast', series = 3)
+plot(ar_mod, type = 'forecast', series = 4)
+plot(ar_mod, type = 'forecast', series = 5)
+plot(ar_mod, type = 'forecast', series = 6)
+plot(ar_mod, type = 'forecast', series = 7)
+
+plot(ar_mod, type = 'residuals', series = 1)
+plot(ar_mod, type = 'residuals', series = 2)
+plot(ar_mod, type = 'residuals', series = 3)
+plot(ar_mod, type = 'residuals', series = 4)
+plot(ar_mod, type = 'residuals', series = 5)
+plot(ar_mod, type = 'residuals', series = 6)
+plot(ar_mod, type = 'residuals', series = 7)
+```
+  
+ 
+ 
+  
