@@ -45,6 +45,8 @@ Captures is the total monthly captures across all the plots for 4 different spec
 ```{r}
 portal_ts <- portal_ts |>
   mutate(series = as.factor(species))
+glimpse(portal_ts)
+levels(portal_ts$series)
 ```
 
 Plot them using built in plotting functions from `mvgam`
@@ -77,7 +79,131 @@ portal_ts |>
   labs(y = NULL, 
        x = 'NDVI moving average')
 ```
+```{r}
 
+mod <- mvgam(captures ~
+               # Hierarchical intercepts captures variation in average 
+               # relative abundance 
+              s(series, bs = 're') + 
+              # Hierarchical effect of minimum temperature (shared smooth)
+              s(mintemp, k = 8) + 
+              # Deviation smooths of minimum tempoeratre,
+              # allowing each species response to mintempt to vary from the
+              # shared smooth 
+              s(mintemp, series, bs = "sz", k = 8) - 1,
+             data = portal_ts,
+             family = poisson(),
+             backend = "cmdstanr")
+
+summary(mod)
+
+mcmc_plot(mod, type = "trace") 
+
+pairs(mod, variable = c('mean(series)', 'sd(series)'))
+
+# The population level smooth and the series deviations
+plot(mod, type = 'smooths')
+# Plot the hierarchical intercepts
+plot(mod, type = 're')
+
+# Plot predictions on the outcome scale for minimum temperature and facet by series
+
+plot_predictions(mod, condition = c('mintemp', 'series', 'series'),
+                 points = 0.5, rug = TRUE) +
+  theme(legend.position = "none") + 
+  labs( y = 'Captures', x = 'Minimum temperature')
+
+# Same plot on link scale
+plot_predictions(mod, 
+                 condition = c('mintemp', 'series', 'series'),
+                 type = "link") +
+  theme(legend.position = "none") + 
+  labs( y = 'Captures', x = 'Minimum temperature')
+plot_slopes(mod,
+            variable = 'mintemp',
+            condition = c('series', 'series'),
+            type = 'link') +
+  theme(legend.position = 'none') + 
+  labs(y = 'Log(captures)', x = 'Series')
+
+plot(mod, type = 'forecast', series = 1)
+# No dynamic component so they aren't changing in time, just showing the seasonality. 
+plot(mod, type = 'residuals', series = 1)
+# Model overall isn't capturing the dyanmics
+
+```
+# Now lets add in a dynamic component
+```{r}
+mod2 <- mvgam(captures ~
+                s(series, bs = 're') +
+                # Hierarchical tensort products of mintemp and NDVI capture 
+                # nonlinear interactions of these two covariates
+                te(mintemp, ndvi_ma12, k = c(3,5))+
+                te(mintemp, ndvi_ma12, by = series,
+                   k = c(3,5), m = 1) -1,
+              data = portal_ts,
+              family = poisson(),
+              backend = 'cmdstanr'
+              )
+summary(mod2)
+plot(mod2, type = 'smooths')
+
+gratia::draw(mod2$mgcv_model)
+
+plot_predictions(mod2,
+                 condition = c('mintemp', 'ndvi_ma12', 'series'),
+                 points = 0.5, conf_level = 0.5) + 
+  labs( y = "Captures", x = 'Min temp')
+
+plot_predictions(mod2,
+                 condition = c('ndvi_ma12', 'mintemp', 'series'),
+               points = 0.5, conf_level = 0.5) + 
+  labs( y = "Captures", x = 'NDVI')
+
+# Still not capturing the overall temporal trend 
+
+```
+State space format! 
+```{r}
+mod3 <- mvgam(captures ~ -1,
+              trend_formula  = ~
+                # Use trend rather than series because can share same 
+                # latent process model for multiple observation time series
+                # everything happening on process model
+                s(trend, bs = 're') + 
+                te(mintemp, ndvi_ma12, k = c(3,5)) +
+                te(mintemp, ndvi_ma12, by = trend,
+                   k = c(3,5), m = 1),
+              trend_model = 'AR1',
+              priors = c(prior(exponential(1), class = sigma),
+                         prior(normal(0.5, 0.25), class = ar1,
+                               lb = -1, ub = 1)),
+              data = portal_ts,
+              backend = 'cmdstanr',
+              family = poisson()
+)
+summary(mod3)
+mcmc_plot(mod3, variable = 'ar1', regex = TRUE, type = 'areas')
+plot(mod3, type = 'smooths', trend_effects = TRUE)
+
+# Eevrything else works in the same way, can still make plots on the
+# observation scale
+# might be a little bit cleaner because using the latent process
+# None of this changes whether your working on observation or process scale
+# Predictions are different
+
+# These are fitting much better
+plot(mod3, type = 'forecast', series = 1)
+plot(mod3, type = 'residuals', series = 1)
+
+loo_compare(mod3, mod2, mod)
+
+
+# How to generate forecasts?? 
+
+# Feed new data to the forecast function
+
+```
 Looks like there might be some non linear effects, and we also know that rodents 
 in this system dont show immediate response to climate or environment changes, 
 the responses are often delayed and can be thought of as cumulative responses to 
