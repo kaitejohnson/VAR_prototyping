@@ -37,6 +37,10 @@ We'll start by grabbing a vintage of the data from January 3rd, 2025.
 This is from a dataset containing counts of new ED visits due to ILI from each of
 the 5 boroughs, plus citywide admissions and unknown admissions, from March of 2017 
 through the day before the forecast date (January 2nd, 2025). 
+
+We'll start by truncating the data to after October 2023 for consistency with 
+the NSSP data, to exclude COVID pandemic years, and to speed up model run time. 
+We will likely want to add the data back in later 
 ```{r}
 
 raw_data <- read.csv("https://raw.githubusercontent.com/reichlab/flu-metrocast/refs/heads/main/raw-data/NYC_ED_daily_asof_01-03-2025.csv")
@@ -45,14 +49,19 @@ head(raw_data)
 data_formatted <- raw_data |>
   mutate(
     date = as.Date(Date, format = "%m/%d/%Y") + years(2000),
-    time = as.integer(date - min(date) + 1),
     count = as.integer(X),
-    series = as.factor(Dim1Value)
+    series = as.factor(Dim1Value),
+    # Eventually we will want to scale these (compute z scores) but leave for now
+    year = year(date), 
+    week = week(date),
+    day_of_week = wday(date)
   ) |>
   filter(Dim2Value == "All age groups", 
-         !is.na(count)) |>
+         date >= "2023-10-01",) |>
   rename(location = Dim1Value) |>
-  select(time, date, count, series, location)
+  mutate(year = year - min(year) + 1,
+          time = as.integer(date - min(date) + 1)) |> # rescale year
+  select(time, date, count, series, location, year, week, day_of_week)
    
 
 ggplot(data_formatted) +
@@ -60,6 +69,45 @@ ggplot(data_formatted) +
   facet_wrap(~series, scales = "free_y") +
   theme_bw()
 
+```
+Inspect some associations between log(counts + 1) and year, week, and day of week
+for each location to get a sense of how their relative values vary
+over seasons, years, and days
+```{r}
+
+# Plot some smooths to see how these variables change with time 
+loc_to_plot <- 'Citywide'
+data_formatted |>
+  filter(location == loc_to_plot) |>
+  ggplot(aes(x = week, y = log(count + 1))) +
+  geom_point() +
+  geom_smooth(method = "gam", formula = y ~ s(x, k = 12),
+              col = 'darkred', fill = "#A25050") +
+  labs(title =  {{loc_to_plot}},
+       y = "log(count)", 
+       x = 'week') +
+  data_formatted |>
+  filter(location == loc_to_plot) |>
+  ggplot(aes(x = year, y = log(count + 1))) +
+  geom_point() +
+  geom_smooth(method = "gam", formula = y ~ s(x, k = 3),
+              col = 'darkred', fill = "#A25050") +
+  labs(title =  {{loc_to_plot}},
+       y = "log(count)", 
+       x = 'year') +
+  data_formatted |>
+  filter(location == loc_to_plot) |>
+  ggplot(aes(x = day_of_week, y = log(count + 1))) +
+  geom_point() +
+  geom_smooth(method = "gam", formula = y ~ s(x, k = 3),
+              col = 'darkred', fill = "#A25050") +
+  labs(title = {{loc_to_plot}},
+       y = "log(count)", 
+       x = 'day of week') 
+  
+```
+
+```{r}
 plot_mvgam_series(data = data_formatted,
                   y = "count",
                   series = "all")
@@ -70,71 +118,104 @@ plot_mvgam_series(data = data_formatted,
 ```
 ## Data wrangling
 
-We need to have every time point for every location in the dataset, 
-even if it is missing so the indices all line up for stan. 
-We also will have to pass in the lagged matrices we want, as is 
-done in the distributed lag tutorial. We can do so by creating a full spine
-of the dates and joining the data to that
-on the dates and values, and then following the tutorial to set up the
-lagged matrices. 
+We can't have any missing values in the predictors, so we will have to make 
+sure that time is complete for all locations 
 ```{r}
-date_df <- data.frame(date = 
-                        seq(from = min(data_formatted$date), 
-                            to = max(data_formatted$date), 
-                            by = "days") 
-)
-# Expand to have rows for all date-location combinations, even if they are missing
+# Expand to have rows for all date-location combinations, 
+# even if they are missing a count value (since that is ok). 
 model_data <- data_formatted |>
-  right_join(date_df)
+  group_by(series, location) |>
+  complete(date = seq(min(date), max(date), by = "day")) |>
+  ungroup() |>
+  # Remake the predictors to fill in the missing ones 
+  mutate(
+    year = year(date), 
+    week = week(date),
+    day_of_week = wday(date)
+  ) |>
+  mutate(year = year - min(year) + 1,
+          time = as.integer(date - min(date) + 1)
+         )|>
+ select(time, date, count, series, location, year, week, day_of_week)
 
-# Eventually fill in missing data with something model based, for now just
-# fill in with mean 
-model_data$count[is.na(model_data$count)] <- round(mean(model_data$count))
 
-model_data <- model_data |>
-  filter(!is.na(location))
 ggplot(model_data) +
   geom_line(aes(x = time, y = count)) +
   facet_wrap(~series, scales = "free_y") +
   theme_bw()
 
-# Feature engineering
-#1. Distributed lag matrices for environmental covariates
-# Function to set up a lag matrix for distributed lag nonlinear models
-lagard <- function(x, n_lag = 6){
-  n <- length(x)
-  X <- matrix(NA, n, n_lag)
-  for (i in 1:n_lag) X[i:n, i] <- x[i:n - i + 1]
-  X
-}
-
-
-
-
 
 ```
 
 ## Fit a VAR(1) model
-We will use the `trend_formula()` argument to specify we want a state-space model, and we can use the `trend_model()` to specify that we want the latent process to evolve as Vector Autoregression of order 1. This takes advantage of developments in the field that enforce stationarity through a principled prior on the autoregressive coefficients. Because magnitude of average coutns varies across regions, we will need to include region level intercepts in the process model. And since the response variable is positive integered values, we can choose to use a Poisson distribution for the observation model.
+We will use the `trend_formula()` argument to specify we want a state-space 
+model, and we can use the `trend_model()` to specify that we want the latent 
+process to evolve as Vector Autoregression of order 1. This takes advantage of
+developments in the field that enforce stationarity through a principled prior
+on the autoregressive coefficients. Because magnitude of average coutns varies 
+across regions, we will need to include region level intercepts in the process 
+model. And since the response variable is positive integered values, we can
+choose to use a Poisson distribution for the observation model.
 
-First look at the default prior distributions for the parameters in the model
-
+First, create the forecast data by extending the dates for all locations
+28 days into the future, which should cover completely the 4 week horizons 
+we want to forecast. 
 ```{r}
-def_priors <- get_mvgam_priors(count ~ -1,
-                               trend_formula = ~s(trend, bs = "re") -1,
-                               trend_model = "AR1",
-                               data = model_data,
-                               family = poisson())
-
+forecast_days <- 28
+forecast_data <- model_data |>
+  group_by(series, location) |>
+  tidyr::complete(date = seq(from = max(date) + days(1), 
+                             to = max(date) + days(forecast_days),
+                             by = "days")) |>
+  ungroup() |>
+  mutate(
+    year = year(date), 
+    week = week(date),
+    day_of_week = wday(date)
+  ) |>
+  mutate(year = year - min(year) + 1,
+          time = as.integer(date - min(date) + 1)
+         ) |>
+  filter(date > max(model_data$date))
 ```
 
+Define a state-space dynamical hierarchical GAM. Start using AR1 trend model,
+later can look into a vector autoregression which will jointly estimate the
+AR coefficients across the locations. 
 ```{r}
-var_mod <- mvgam(
+ar_mod <- mvgam(
   # Observation formula, empty to only consider the Gamma observation process
   formula = count ~ -1,
   
   # Process model formula that includes regional intercepts
-  trend_formula = ~ s(trend, bs = "re") ,
+  trend_formula = ~ 
+    # Hierarhical intercepts capture variation in average count
+    s(trend, bs = "re") + 
+    # Hierarchical effects of year(shared smooth)
+    s(year, k = 2) +
+    # Borough level deviations
+    s(year, trend, bs = "sz", k = 2) -1 + 
+    
+    # Hierarchical effects of week(shared smooth)
+    s(week, k = 12) +
+    # Borough level deviations 
+    s(week, trend, bs = "sz", k = 12) - 1 +
+    
+    # Hierarchical effects of day of week (shared smooth)
+    s(day_of_week, k = 3) +
+    # Borough level deviations
+    s(day_of_week, trend, bs = "sz", k = 3) - 1,
+  trend_model = 'AR1',
+  priors = c(prior(exponential(1), class = sigma),
+                         prior(normal(0.5, 0.25), class = ar1,
+                               lb = -1, ub = 1)),
+  data = model_data,
+  newdata = forecast_data,
+  backend = 'cmdstanr',
+  family = poisson()
+)
+```
+
   
   # A VAR(1) dynamic process with fully parameterized covariance matrix Sigma
   trend_model = AR(),
