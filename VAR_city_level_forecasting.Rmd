@@ -70,12 +70,17 @@ data_formatted <- raw_data |>
     week = week(date),
     day_of_week = wday(date)
   ) |>
-  filter(Dim2Value == "All age groups", 
-         date >= "2023-10-01",) |>
+  filter(Dim2Value == "All age groups") |>
+        ## date >= "2023-10-01",) |>
   rename(location = Dim1Value) |>
   mutate(year = year - min(year) + 1,
           time = as.integer(date - min(date) + 1)) |> # rescale year
-  select(time, date, count, series, location, year, week, day_of_week)
+  select(time, date, count, series, location, year, week, day_of_week) |>
+  # Exclude the covid years
+  filter(!date %in% seq(from = ymd("2020-02-01"), 
+                        to = ymd("2022-03-01"), 
+                        by = "day"))
+
    
 
 ggplot(data_formatted) +
@@ -161,7 +166,7 @@ ggplot(model_data) +
 # Make a plot of the time series overlaid to see if can visually see leading 
 # vs lagging trends 
 ggplot(model_data |> group_by(location) |>
-         mutate(rel_count = count/max(count)))+
+         mutate(rel_count = count/max(count, na.rm = TRUE)))+
   geom_line(aes(x = time, 
                 y = rel_count, 
                 color = location), alpha = 0.3) +
@@ -219,8 +224,6 @@ x_{l,t} \sim MVN(\mu_{l,t} + \delta_{l} x_{l,t-1},  \Sigma_{process})\\
 \Sigma_{process} = \sigma * C * \sigma \\
 \sigma \sim exp(1) \\
 C \sim LKJcorr(2)
-
-
 $$
 Start by getting the default parameters and modifying
 ```{r}
@@ -267,7 +270,7 @@ ar_mod <- mvgam(
   trend_model = 'AR1',
   #Adjust the priors 
   priors = c(
-    prior(normal(4.7, 1), class = mu_raw_trend),
+    prior(normal(4.4, 1), class = mu_raw_trend),
     prior(exponential(0.33), class = sigma_raw_trend),
   
     prior(exponential(1), class = sigma),
@@ -334,17 +337,18 @@ plot(ar_mod, type = 'residuals', series = 7)
 ```
 
 
-## Model 2: Hierarchical GAM + vector autorgression 
+## Model 2: Vector autorgression 
 Define a state-space dynamical hierarchical GAM with a vector autoregression 
 to account for dependencies between the locations
+
+Note this is not working as expected, likely something wrong with the VAR since
+that is the only major change from the previous model. 
 $$
 y_{l,t} \sim Poisson(exp(x_{l,t})) \\
-x_{l,t} \sim MVN(\mu_{l,t} + A x_{l,t-1},  \Sigma_{process})\\
-\mu_{l,t} = \beta_l + f_{global,t}(week) + f_{l,t}(week) + f_{global,t}(wday) \\
+x_{l,t} \sim MVN(\mu_{l,t} + A * x_{l,t-1},  \Sigma_{process})\\
+\mu_{l,t} = \beta_l +  f_{global}(week) \\
 \beta_l \sim Normal(\beta_{global}, \sigma_{count}) \\
 \beta_{global} \sim Normal(log(avgcount), 1) \\
-\sigma_{count} \sim exp(0.33) \\
-\delta_l \sim Normal(0.5, 0.25) \\
 \Sigma_{process} = \sigma * C * \sigma \\
 A \exists P(R)\\
 P \sim Normal(0, 0.67) \\
@@ -355,14 +359,11 @@ C \sim LKJcorr(2)
 $$
 ```{r}
 def_priors_var <- get_mvgam_priors(formula = count ~ -1,
-                                   trend_formula = ~ 
-                                   s(trend, bs = "re") + 
-                                   s(week, k = 12) +
-                                   s(week, trend, bs = "sz", k = 12) - 1 +
-                                  s(day_of_week, k = 3),
-                                  trend_model = VAR(cor = TRUE),
-                                  data = model_data,
-                                 family = poisson())
+                                   trend_formula = ~ location,
+                                   s(trend, week, k = 12) + 
+                                    trend_model = VAR(cor = TRUE),
+                                    data = model_data,
+                                    family = poisson())
 ```
 Note this model is a lot slower because of all the off-diagonal 
 components of A that we are now estimating!
@@ -370,52 +371,40 @@ components of A that we are now estimating!
 var_mod <- mvgam(
   # Observation formula, empty to only consider the Gamma observation process
   formula = count ~ -1,
-  
-  # Process model formula that includes regional intercepts
+
+  # Process model formula that includes regional intercepts and global weekly
+  # trend 
   trend_formula = ~ 
-    # Hierarchical intercepts capture variation in average count
-    s(trend, bs = "re") + 
-    # Hierarchical effects of year(shared smooth)
-    # s(year, k = 3) +
-    # # Borough level deviations
-    # s(year, trend, bs = "sz", k = 3) -1 + 
-    
-    # Hierarchical effects of week(shared smooth)
-    s(week, k = 12) +
-    # Borough level deviations 
-    s(week, trend, bs = "sz", k = 12) - 1 +
-    
-    # Shared smooth of day of week 
-    s(day_of_week, k = 3),
+  s(trend, bs = "re") + 
+  s(week, k = 12), 
   trend_model = VAR(cor = TRUE),
   #Adjust the priors 
-  priors = c(
-    prior(normal(4.7, 1), class = mu_raw_trend),
-    prior(exponential(0.33), class = sigma_raw_trend),
-    prior(exponential(1), class = sigma)
-    ),
+  priors = c(prior(std_normal(), class = Intercept_trend),
+            prior(exponential(2.5), class = sigma),
+            prior(normal(4.7, 1), class = mu_raw_trend)),
   data = model_data,
   newdata = forecast_data,
   backend = 'cmdstanr',
-  family = poisson()
+  family = poisson(),
+  burnin = 250,
+  samples = 500
 )
 ```
 Make the same plots as previously
 ```{r}
 summary(var_mod)
+plot(var_mod, type = 'smooths', trend_effects = TRUE)
+# Hierarchical intercepts ?? Actually not sure 
+plot(var_mod, type = 're', trend_effects = TRUE)
 
 plot_predictions(var_mod,
                  condition = c('week', 'series'),
                  points = 0.5, conf_level = 0.5) +
   labs(y = "Counts", x = "week")
 
-plot_predictions(var_mod,
-                 condition = c('week', 'day_of_week', 'series'),
-                 points = 0.5, conf_level = 0.5) +
-  labs(y = "Counts", x = "week")
 
 conditional_effects(var_mod)
-mcmc_plot(ar_mod,
+mcmc_plot(var_mod,
           variable = 'sigma',
           regex = TRUE,
           type = 'trace')
@@ -431,6 +420,7 @@ plot_slopes(var_mod,
 plot(var_mod, type = 'smooths', trend_effects = TRUE)
 # Hierarchical intercepts ?? Actually not sure 
 plot(var_mod, type = 're', trend_effects = TRUE)
+
 ```
   
  # Plot the forecasts and the residuals 
@@ -455,7 +445,7 @@ plot(var_mod, type = 'residuals', series = 7)
 
 Compare models
 ```{r}
-loo_compare(var_mod, ar_mod)
+loo_compare(ar_mod, var_mod)
 ```
  
 Other options to add:
