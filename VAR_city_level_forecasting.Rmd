@@ -603,7 +603,7 @@ ggplot(dfall2 |> filter(draw %in% c(sampled_draws),
                 color = period),
             alpha = 0.2) + 
   geom_point(aes(x = date, y = obs_count,
-                 group = draw))+
+                 group = draw), linewidth = 0.5)+
   coord_cartesian(xlim= ) +
   facet_wrap(~location, scales = "free_y")
 
@@ -651,8 +651,11 @@ ggplot() +
  
 
 ```
-
-```
+These forecasts are much more confident about the decline, and generally less
+dispersed than the ones fit to the historic seasons. 
+This is logical, as the model has only been able to learn the seasonality from
+one complete seasons (2023-2024), rather than across many where its likely that
+the peak timing varied significantly (potentially even with multiple peaks). 
 
   
 
