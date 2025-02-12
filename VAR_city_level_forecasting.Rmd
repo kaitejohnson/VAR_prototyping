@@ -192,7 +192,7 @@ First, create the forecast data by extending the dates for all locations
 28 days into the future, which should cover completely the 4 week horizons 
 we want to forecast. 
 ```{r}
-forecast_days <- 28
+forecast_days <- 30
 forecast_data <- model_data |>
   group_by(series, location) |>
   tidyr::complete(date = seq(from = max(date) + days(1), 
