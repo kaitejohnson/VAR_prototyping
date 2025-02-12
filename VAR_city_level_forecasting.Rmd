@@ -12,6 +12,7 @@ library(ggplot2)         # Flexible plotting
 library(tidybayes)       # Graceful plotting of Bayesian posterior estimates
 library(farver)          # Colour space manipulations
 library(lubridate)       # Date formatting
+library(forecasttools)   # Helper functions for forecast formatting
 
 theme_set(theme_classic(base_size = 15,
                         base_family = 'serif'))
@@ -56,7 +57,7 @@ We'll start by truncating the data to after October 2023 for consistency with
 the NSSP data, to exclude COVID pandemic years, and to speed up model run time. 
 We will likely want to add the data back in later 
 ```{r}
-
+forecast_date <- "2025-01-03"
 raw_data <- read.csv("https://raw.githubusercontent.com/reichlab/flu-metrocast/refs/heads/main/raw-data/NYC_ED_daily_asof_01-03-2025.csv")
 head(raw_data)
 
@@ -334,6 +335,174 @@ plot(ar_mod, type = 'residuals', series = 4)
 plot(ar_mod, type = 'residuals', series = 5)
 plot(ar_mod, type = 'residuals', series = 6)
 plot(ar_mod, type = 'residuals', series = 7)
+```
+Let's pretend we wanted to submit the forecasts. We'd need to extract the
+posterior draws from only the forecast horizon/dates we want to forecast, 
+aggregate into weekly sums by draw, and then summarize into quantiles. 
+First, let's grab the draws and make some plots to make sure things look ok. 
+```{r}
+forecast_obj <- forecast(ar_mod, newdata = forecast_data, type = "response")
+for (i in 1:length(unique(model_data$location))){
+  matrix_preds <- forecast_obj$forecasts[[i]]
+  matrix_hindcasts <- forecast_obj$hindcasts[[i]]
+  df_i <- as.data.frame(matrix_preds) |>
+    mutate(draw = seq(from = 1, to = nrow(matrix_preds))
+    ) 
+  colnames(df_i) <- c(as.character(
+                        seq(from = 1, to = ncol(matrix_preds),
+                            by = 1)), "draw")
+  df_i <- df_i |> 
+    pivot_longer(!draw,
+                 names_to = "t",
+                 values_to = "count") |>
+    mutate(location = unique(model_data$location)[i],
+           t = as.integer(t) + ncol(matrix_hindcasts),
+           period = "forecast")
+  
+  dfhind_i <- as.data.frame(matrix_hindcasts) |>
+    mutate(draw = seq(from = 1, 
+                      to = nrow(matrix_hindcasts))
+    ) 
+  colnames(dfhind_i) <- c(as.character(
+                        seq(from = 1, to = ncol(matrix_hindcasts),
+                            by = 1)), "draw")
+  dfhind_i <- dfhind_i |> 
+    pivot_longer(!draw,
+                 names_to = "t",
+                 values_to = "count") |>
+    mutate(location = unique(model_data$location)[i],
+           t = as.integer(t),
+           period = "hindcast")
+  if(i ==1){
+    df <- df_i
+    df_hind <- dfhind_i
+  }else{
+    df <- bind_rows(df, df_i)
+    df_hind <- bind_rows(df_hind, dfhind_i)
+  }
+}
+
+dfall <- bind_rows(df, df_hind)
+dfall <- dfall |>
+  left_join(data.frame(
+    t = 1:max(dfall$t),
+    date = seq(from = min(model_data$date),
+               to = min(model_data$date) + max(dfall$t) - 1,
+               by = "day")
+  ), by = "t")
+
+
+# Quick plot
+sampled_draws <- sample(1:max(df$draw), 100)
+ggplot(dfall |> filter(draw %in% c(sampled_draws),
+                       date >= "2024-10-01"))+
+  geom_line(aes(x = date, y = count, 
+                group = draw, 
+                color = period),
+            alpha = 0.2) + 
+  coord_cartesian(xlim= ) +
+  facet_wrap(~location, scales = "free_y")
+
+
+```
+Next, we have to summarize our predictions from daily to weekly, at the level
+of epiweeks. Luckily, the theres a function for `epiweek` in the
+`lubridate` package.
+We'll start with the full set of data and then filter. Note, we need to 
+produce 2 more days of forecasts to forecast out the full 5 epi weeks
+(28 days + )
+```{r}
+df_forecasts <- dfall |>
+  filter(date >= ymd(forecast_date) - days(5)) |>
+  mutate(epiweek = epiweek(date),
+         year = year(date),
+         reference_date = ymd(forecast_date) + 
+           (7- wday(ymd(forecast_date), week_start = 7)),
+         target_end_date = ymd(date) + (7 - wday(date, week_start = 7))) |>
+  arrange(date) 
+
+df_weekly <- df_forecasts |>
+  group_by(
+    reference_date,
+    target_end_date,
+    location,
+    draw
+  ) |>
+  summarize(
+    n_days_data =  n(),
+    count_7d = sum(count)
+  ) |>
+  ungroup() |>
+  dplyr::mutate(
+    horizon = floor(as.integer(target_end_date - reference_date))/7
+  )
+
+stopifnot( "Not all weeks contain 7 days of data",
+           all(df_weekly$n_days_data == 7))
+
+df_weekly_quantiled <- df_weekly |> 
+  trajectories_to_quantiles( timepoint_cols = c("target_end_date"),
+                             value_col = "count_7d",
+                             id_cols = c("location", "reference_date",
+                                         "horizon")) |>
+  mutate(output_type = "quantile",
+         target = "ILI ED visits",
+         location = ifelse(location == "Citywide", "NYC", location)) |>
+  rename(output_type_id = quantile_level,
+         value = quantile_value) |>
+  select(reference_date, location, horizon, target, target_end_date,
+         output_type, output_type_id, value)
+```
+Make a quick plot of the forecasts vs the data up until the forecast date
+```{r}
+data_weekly <- model_data |> 
+  mutate(
+  epiweek = epiweek(date), 
+  target_end_date = ymd(date) + (7 - wday(date, week_start = 7)),
+  reference_date = ymd(forecast_date) + 
+           (7- wday(ymd(forecast_date), week_start = 7))
+) |> 
+  group_by(epiweek, target_end_date, location, reference_date) |>
+  summarize(
+    obs_weekly_sum = sum(count)
+  ) |>
+  filter(target_end_date >= reference_date - weeks(10),
+         target_end_date != reference_date) |>
+  mutate(location = ifelse(location == "Citywide", "NYC", location))
+
+df_quantiles_wide <- df_weekly_quantiled |>
+  filter(output_type_id %in% c(0.5, 0.025, 0.975, 0.25, 0.75)) |>
+  tidyr::pivot_wider(id_cols = c("location", "target_end_date"),
+                     names_from = "output_type_id")
+ 
+  
+ggplot() +
+  geom_line(data = data_weekly,
+            aes(x= target_end_date, y = obs_weekly_sum)) +
+    geom_point(data = data_weekly,
+            aes(x= target_end_date, y = obs_weekly_sum)) +
+  facet_wrap(~location, scales = "free_y") +
+  geom_line(data = df_quantiles_wide,
+            aes(x = target_end_date, y = `0.5`)) +
+  geom_ribbon(data = df_quantiles_wide,
+              aes(x = target_end_date,
+                  ymin = `0.25`,
+                  ymax = `0.75`),
+              alpha = 0.2) + 
+  geom_ribbon(data = df_quantiles_wide,
+              aes(x = target_end_date,
+                  ymin = `0.025`,
+                  ymax = `0.975`),
+              alpha = 0.2) 
+ 
+
+```
+
+  
+
+
+  
+  
 ```
 
 
