@@ -533,7 +533,10 @@ using the functions we defined above.
 ```{r}
 # Create new model data and new forecast data
 model_data2 <- model_data |>
-  filter(date >= "2023-10-01")
+  filter(date >= "2023-10-01") |>
+  mutate(year = year - min(year) + 1,
+          time = as.integer(date - min(date) + 1)
+         )
 forecast_data2 <- model_data2 |>
   group_by(series, location) |>
   tidyr::complete(date = seq(from = max(date) + days(1), 
@@ -599,6 +602,8 @@ ggplot(dfall2 |> filter(draw %in% c(sampled_draws),
                 group = draw, 
                 color = period),
             alpha = 0.2) + 
+  geom_point(aes(x = date, y = obs_count,
+                 group = draw))+
   coord_cartesian(xlim= ) +
   facet_wrap(~location, scales = "free_y")
 
