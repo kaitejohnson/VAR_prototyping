@@ -524,14 +524,136 @@ ggplot() +
  
 
 ```
+Let's try fitting the exact same model, but only to the data from October 2023
+onwards. 
 
+We'll call the model formula again, and then do the exact same post-processing,
+using the functions we defined above. 
 
+```{r}
+# Create new model data and new forecast data
+model_data2 <- model_data |>
+  filter(date >= "2023-10-01")
+forecast_data2 <- model_data2 |>
+  group_by(series, location) |>
+  tidyr::complete(date = seq(from = max(date) + days(1), 
+                             to = max(date) + days(forecast_days),
+                             by = "days")) |>
+  ungroup() |>
+  mutate(
+    year = year(date), 
+    week = week(date),
+    day_of_week = wday(date)
+  ) |>
+  mutate(year = year - min(year) + 1,
+          time = as.integer(date - min(date) + 1)
+         ) |>
+  filter(date > max(model_data2$date))
+
+ar_mod_short_ts <- mvgam(
+  # Observation formula, empty to only consider the Gamma observation process
+  formula = count ~ -1,
   
+  # Process model formula that includes regional intercepts
+  trend_formula = ~ 
+    # Hierarchical intercepts capture variation in average count
+    s(trend, bs = "re") + 
+    # Hierarchical effects of year(shared smooth)
+    # s(year, k = 3) +
+    # # Borough level deviations
+    # s(year, trend, bs = "sz", k = 3) -1 + 
+    
+    # Hierarchical effects of week(shared smooth)
+    s(week, k = 12) +
+    # Borough level deviations 
+    s(week, trend, bs = "sz", k = 12) - 1 +
+    
+    # Shared smooth of day of week 
+    s(day_of_week, k = 3),
+  trend_model = 'AR1',
+  #Adjust the priors 
+  priors = c(
+    prior(normal(4.4, 1), class = mu_raw_trend),
+    prior(exponential(0.33), class = sigma_raw_trend),
+  
+    prior(exponential(1), class = sigma),
+    prior(normal(0.5, 0.25), class = ar1, lb = -1, ub = 1)),
+  data = model_data2,
+  newdata = forecast_data2,
+  backend = 'cmdstanr',
+  family = poisson()
+)
+
+forecast_obj2 <- forecast(ar_mod_short_ts,
+                         newdata = forecast_data2, 
+                         type = "response")
 
 
+dfall2 <- make_long_pred_df(forecast_obj2, model_data2)
+
+# Quick plot
+sampled_draws <- sample(1:max(dfall2$draw), 100)
+ggplot(dfall2 |> filter(draw %in% c(sampled_draws),
+                       date >= "2024-10-01"))+
+  geom_line(aes(x = date, y = count, 
+                group = draw, 
+                color = period),
+            alpha = 0.2) + 
+  coord_cartesian(xlim= ) +
+  facet_wrap(~location, scales = "free_y")
+
+df_weekly2 <- daily_to_epiweekly_data(dfall2, forecast_date)
+
+if(!all(df_weekly2$n_days_data[df_weekly2$horizon >=0] == 7)){
+  cli::cli_abort(
+    message = "Not all weeks contain 7 days of data"
+  )
+}
+
+df_weekly_quantiled2 <- format_NYC_forecasts(df_weekly2)
+
+df_quantiles_wide2 <- df_weekly_quantiled2 |>
+  filter(target_end_date >= reference_date, 
+    output_type_id %in% c(0.5, 0.025, 0.975, 0.25, 0.75)) |>
+  tidyr::pivot_wider(id_cols = c("location", "target_end_date"),
+                     names_from = "output_type_id") 
+
+ 
   
-  
+ggplot() +
+  geom_line(data = df_weekly_quantiled2 |>
+              filter(target_end_date >= reference_date - weeks(10)),
+            aes(x= target_end_date, y = obs_weekly_sum)) +
+    geom_point(data = df_weekly_quantiled2 |>
+                 filter(target_end_date >= reference_date - weeks(10)),
+            aes(x = target_end_date, y = obs_weekly_sum)) +
+  facet_wrap(~location, scales = "free_y") +
+  geom_line(data = df_quantiles_wide2,
+            aes(x = target_end_date, y = `0.5`)) +
+  geom_ribbon(data = df_quantiles_wide2,
+              aes(x = target_end_date,
+                  ymin = `0.25`,
+                  ymax = `0.75`),
+              alpha = 0.2) + 
+  geom_ribbon(data = df_quantiles_wide2,
+              aes(x = target_end_date,
+                  ymin = `0.025`,
+                  ymax = `0.975`),
+              alpha = 0.2) +
+  xlab("") +
+  ylab("ILI ED visits") +
+  ggtitle("Dynamic GAM fit to data from after October 2023")
+ 
+
 ```
+
+```
+
+  
+
+
+  
+  
 
 
 ## Model 2: Vector autorgression 
