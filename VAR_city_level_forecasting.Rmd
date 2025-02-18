@@ -216,15 +216,14 @@ later can look into a vector autoregression which will jointly estimate the
 AR coefficients across the locations... 
 $$
 y_{l,t} \sim Poisson(exp(x_{l,t})) \\
-x_{l,t} \sim MVN(\mu_{l,t} + \delta_{l} x_{l,t-1},  \Sigma_{process})\\
+x_{l,t} \sim Normal(\mu_{l,t} + \delta_{l} x_{l,t-1},  \sigma_{process})\\
 \mu_{l,t} = \beta_l + f_{global,t}(week) + f_{l,t}(week) + f_{global,t}(wday) \\
 \beta_l \sim Normal(\beta_{global}, \sigma_{count}) \\
 \beta_{global} \sim Normal(log(avgcount), 1) \\
 \sigma_{count} \sim exp(0.33) \\
 \delta_l \sim Normal(0.5, 0.25) \\
-\Sigma_{process} = \sigma * C * \sigma \\
 \sigma \sim exp(1) \\
-C \sim LKJcorr(2)
+
 $$
 Start by getting the default parameters and modifying
 ```{r}
@@ -686,9 +685,10 @@ C \sim LKJcorr(2)
 $$
 ```{r}
 def_priors_var <- get_mvgam_priors(formula = count ~ -1,
-                                   trend_formula = ~ location,
-                                   s(trend, week, k = 12) + 
-                                    trend_model = VAR(cor = TRUE),
+                                   trend_formula = ~ 
+                                    s(trend, bs = "re") + 
+                                    s(trend, week, k = 12),
+                                  trend_model = VAR(cor = TRUE),
                                     data = model_data,
                                     family = poisson())
 ```
